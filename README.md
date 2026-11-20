@@ -128,10 +128,19 @@ Mobile-first, one column, readable at 390px:
 
 ## Tests
 
+One way to run them, locally and in CI:
+
 ```sh
-node --test tests/                 # Node 26
-node --test tests/*.test.mjs       # Node 22/24: they do not take a directory
+make test            # the suite, 48 tests
+make scripts-test    # the same recipe under the name bin/preflight detects
 ```
+
+`make test` is `node --test tests/*.test.mjs` — the glob, not `tests/`, because
+Node 22 and 24 do not take a directory there. CI (`.github/workflows/ci.yml`)
+runs on every pull request and on every push to `main`: Node 22 on
+`ubuntu-latest`, `node --version`, `make test`, and `bash -n bin/herdr-phone`
+to prove the launcher still parses. No `npm install` — there is nothing to
+install.
 
 No network, no real Herdr: every `hc` / `herdr-app` call is stubbed, and the
 tests talk to a real server on an ephemeral loopback port. They pin the token

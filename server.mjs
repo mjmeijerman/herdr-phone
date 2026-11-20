@@ -245,6 +245,28 @@ export function groupAgents(live, finished, names = new Map()) {
   return { groups, agents, finished: gone };
 }
 
+// ------------------------------------------------------- the page's toggles
+// Pure, framework-free, and embedded in PAGE below, so the tests exercise the
+// same source the phone runs. Nothing here touches the DOM or the network.
+
+/** One screen at a time: the open row tapped again closes it, another switches. */
+export function toggleTerminal(state, address) {
+  const next = state.terminal === address ? null : address;
+  state.terminal = next;
+  return next;
+}
+
+/** The finished section opens and closes; `state.gone` keeps the rows it got. */
+export function toggleFinished(state) {
+  state.all = !state.all;
+  return state.all;
+}
+
+/** Only the first expand asks the server; a cached section never refetches. */
+export function needsFinishedFetch(state) {
+  return Boolean(state.all) && !(Array.isArray(state.gone) && state.gone.length > 0);
+}
+
 /**
  * Merge `herdr-app ls` (spaces, tabs, terminal ids) with `hc ls` (live state)
  * into one list shaped for the page. If herdr-app is unreachable, rebuild the
@@ -869,6 +891,9 @@ export const PAGE = String.raw`<!doctype html>
   main .bar .addr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); }
   main .bar .spacer { flex: 1; }
   main .bar button { min-height: 32px; min-width: 44px; font-size: 12px; padding: 0 10px; }
+  main .bar button#close { min-height: 44px; }
+  main .bar button#close[hidden] { display: none; }
+  .finished[aria-expanded="true"] { color: var(--fg); }
   #out {
     flex: 1;
     margin: 0;
@@ -963,6 +988,7 @@ export const PAGE = String.raw`<!doctype html>
     <span class="addr" id="addr">no terminal</span>
     <span id="termstate"></span>
     <span class="spacer"></span>
+    <button id="close" hidden>Close</button>
     <button id="wrap">wrap</button>
   </div>
   <pre id="out" class="empty">Pick a tab above to watch its terminal.</pre>
@@ -998,8 +1024,12 @@ export const PAGE = String.raw`<!doctype html>
 <script>
 (function () {
   'use strict';
+  // Shared with the tests: the exported helpers from server.mjs, embedded as source.
+  var toggleTerminal = ${toggleTerminal};
+  var toggleFinished = ${toggleFinished};
+  var needsFinishedFetch = ${needsFinishedFetch};
   var state = {
-    terminal: null, data: null, groups: { working: 0, done: 0, idle: 0, finished: 0 },
+    terminal: null, data: null, gone: [], groups: { working: 0, done: 0, idle: 0, finished: 0 },
     filter: 'all', all: false, renderedKey: '',
     timer: null, poll: null, armed: null, armTimer: null, busy: false
   };
@@ -1011,6 +1041,7 @@ export const PAGE = String.raw`<!doctype html>
     termstate: document.getElementById('termstate'),
     clock: document.getElementById('clock'),
     refbtn: document.getElementById('refresh'),
+    close: document.getElementById('close'),
     wrap: document.getElementById('wrap'),
     text: document.getElementById('text'),
     send: document.getElementById('send'),
@@ -1095,9 +1126,13 @@ export const PAGE = String.raw`<!doctype html>
 
   // --- agents
   function loadTabs() {
-    // ?all=1 is asked for only after the "N finished" line is tapped.
+    // ?all=1 is asked for only after the "N finished" line is tapped, and the
+    // rows it returns are kept in state.gone so collapsing costs no request.
     return api('/api/tabs' + (state.all ? '?all=1' : '')).then(function (data) {
-      state.data = Array.isArray(data.agents) ? data.agents : [];
+      var rows = Array.isArray(data.agents) ? data.agents : [];
+      state.data = rows.filter(function (a) { return a.status !== 'finished'; });
+      var gone = rows.filter(function (a) { return a.status === 'finished'; });
+      if (gone.length) state.gone = gone;
       state.groups = data.groups || { working: 0, done: 0, idle: 0, finished: 0 };
       renderAgents();
       paintChips();
@@ -1156,7 +1191,7 @@ export const PAGE = String.raw`<!doctype html>
    */
   function renderAgents(force) {
     var agents = state.data || [];
-    var key = JSON.stringify([state.filter, state.all, state.groups, agents]);
+    var key = JSON.stringify([state.filter, state.all, state.groups, agents, state.gone, state.terminal]);
     if (!force && key === state.renderedKey) return;
     state.renderedKey = key;
 
@@ -1175,21 +1210,18 @@ export const PAGE = String.raw`<!doctype html>
         rows.map(rowHtml).join('') + '</section>';
     });
 
-    if (state.all && state.filter === 'all') {
-      var gone = agents.filter(function (a) { return a.status === 'finished'; });
-      if (gone.length) {
-        shown += gone.length;
-        html += '<section class="group" data-status="finished">' +
-          '<h2>' + TITLES.finished + ' <span class="count">' + gone.length + '</span></h2>' +
-          gone.map(rowHtml).join('') + '</section>';
-      }
+    var gone = state.gone || [];
+    if (state.all && gone.length) {
+      shown += gone.length;
+      html += '<section class="group" data-status="finished">' +
+        '<h2>' + TITLES.finished + ' <span class="count">' + gone.length + '</span></h2>' +
+        gone.map(rowHtml).join('') + '</section>';
     }
 
-    if (!state.all) {
-      var n = state.groups.finished || 0;
-      html += '<button class="finished" id="finished" data-expand="1"' + (n ? '' : ' disabled') + '>' +
-        n + ' finished' + (n ? ' \u00b7 tap to show' : '') + '</button>';
-    }
+    var n = state.groups.finished || 0;
+    html += '<button class="finished" id="finished" data-expand="1"' +
+      ' aria-expanded="' + (state.all ? 'true' : 'false') + '"' + (n ? '' : ' disabled') + '>' +
+      n + ' finished' + (n ? (state.all ? ' \u00b7 hide' : ' \u00b7 tap to show') : '') + '</button>';
 
     if (!shown && !state.all && !(state.groups.finished > 0)) {
       html = '<div class="empty">No agents reported.</div>';
@@ -1218,8 +1250,11 @@ export const PAGE = String.raw`<!doctype html>
     var expand = ev.target.closest('[data-expand]');
     if (expand) {
       if (expand.disabled) return;
-      state.all = true;
-      loadTabs();
+      toggleFinished(state);
+      // Expanding for the first time asks for ?all=1; collapsing and expanding a
+      // section that already arrived costs nothing.
+      if (needsFinishedFetch(state)) loadTabs();
+      else renderAgents(true);
       return;
     }
     var row = ev.target.closest('.agent');
@@ -1238,16 +1273,38 @@ export const PAGE = String.raw`<!doctype html>
   });
 
   function select(terminal) {
-    state.terminal = terminal;
-    el.addr.textContent = terminal;
+    var next = toggleTerminal(state, terminal);
+    Array.prototype.forEach.call(el.list.querySelectorAll('.agent'), function (row) {
+      row.setAttribute('aria-current', row.getAttribute('data-terminal') === next && next ? 'true' : 'false');
+    });
+    if (!next) {
+      closeScreen();
+      return;
+    }
+    el.addr.textContent = next;
+    el.close.hidden = false;
     el.out.classList.remove('empty');
     el.out.textContent = '';
-    Array.prototype.forEach.call(el.list.querySelectorAll('.agent'), function (row) {
-      row.setAttribute('aria-current', row.getAttribute('data-terminal') === terminal ? 'true' : 'false');
-    });
     clearTimeout(state.poll);
     pollScreen(true);
   }
+
+  /** Close the screen without touching the list: no refetch, no scroll, no re-render. */
+  function closeScreen() {
+    clearTimeout(state.poll);
+    state.terminal = null;
+    Array.prototype.forEach.call(el.list.querySelectorAll('.agent'), function (row) {
+      row.setAttribute('aria-current', 'false');
+    });
+    el.addr.textContent = 'no terminal';
+    el.termstate.textContent = '';
+    el.close.hidden = true;
+    el.out.classList.add('empty');
+    el.out.textContent = 'Pick a tab above to watch its terminal.';
+    el.out.scrollTop = 0;
+  }
+
+  el.close.addEventListener('click', closeScreen);
 
   function pollScreen(now) {
     clearTimeout(state.poll);

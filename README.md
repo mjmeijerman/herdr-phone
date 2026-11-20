@@ -69,7 +69,7 @@ Without one: `401` with an **empty** body — no hint for a scanner.
 | GET | `/` | the page. Public: it holds no data and never the token. |
 | POST | `/login` | `{token}` → sets `hp`, `204`; wrong token → `401`, empty. |
 | POST | `/logout` | drops the cookie, `204`. |
-| GET | `/api/tabs` | `{ok, at, problems, live, spaces:[{name, active, tabs:[{name, active, terminals:[{address, agent, cwd, state, status, working, turn, app, label}]}]}]}` |
+| GET | `/api/tabs` | `{ok, at, problems, live, spaces:[{name, active, tabs:[{name, active, terminals:[{address, agent, cwd, state, status, working, turn, app, label}]}]}], groups:{working, done, idle, finished}, agents:[{space, tab, address, agent, label, status, turn, cwdBase}]}` |
 | GET | `/api/screen?terminal=t19b` | `{terminal, at, screen}` — ANSI and control bytes already stripped. |
 | POST | `/api/send` | `{terminal, text[, confirm]}` → `hc send ADDRESS TEXT` |
 | POST | `/api/keys` | `{terminal, keys:["esc"]}` → `hc keys ADDRESS esc`; allowlist: `enter esc ctrl+c ctrl+d tab up down left right backspace space` |
@@ -79,6 +79,13 @@ Without one: `401` with an **empty** body — no hint for a scanner.
 (live status, turn, cwd). If `herdr-app ls` is unavailable the space/tab tree is
 rebuilt from `hc ls`'s `where` field (`"space / tab"`) and `problems` says so.
 `hc read` failing is a `502`, never a `200` with an empty screen.
+
+`groups` counts the live terminals by status plus `finished`, which comes from
+`hc ls --all` (falling back to its `hidden_finished` summary if that call
+fails). `agents` is the same terminals flattened and sorted working → done →
+idle, newest activity first inside a group; finished terminals join it only when
+the request carries `?all=1`, and they always sort last. `cwdBase` is the
+basename of the terminal's cwd, for a one-line row.
 
 ## Safety
 
@@ -99,11 +106,20 @@ rebuilt from `hc ls`'s `where` field (`"space / tab"`) and `problems` says so.
 
 Mobile-first, one column, readable at 390px:
 
-- one row per space, its tabs under it, a live dot from `hc ls` (green pulse =
-  working, grey = done), `44px` tap targets;
+- a chip row (`All` / `Working` / `Done` / `Idle`, counts from `groups`) that
+  filters the list in place — no request, no reload; it scrolls sideways when it
+  does not fit;
+- sections `Working` / `Done` / `Idle` with a count in each sticky header; each
+  row is a `44px` target with a status dot, the agent or tab name, the space and
+  tab, the turn count, the cwd basename, and a `Read` button that opens the
+  screen view (as does the row);
+- a collapsed `N finished` line at the bottom, which only asks for `?all=1` once
+  you tap it, then shows the finished terminals in their own section;
 - screen view of the selected terminal, `hc read` polled every 2s (paused when
   the tab is hidden), auto-scroll only when you are already at the bottom;
 - `wrap` / `nowrap` toggle: wrapped by default, which is what fits a phone;
+- the 5s list poll repaints only when the payload changed, and the list keeps
+  its scroll position, so the rows do not move under your thumb;
 - input pinned above the iOS keyboard: `100dvh` plus a `visualViewport` listener,
   16px text so iOS does not zoom on focus, `env(safe-area-inset-bottom)`;
 - `?t=t19b` preselects a terminal, so one tab can be bookmarked;

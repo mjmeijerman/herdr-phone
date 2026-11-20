@@ -14,7 +14,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export const HOST = '127.0.0.1';
@@ -161,16 +161,101 @@ function parseJson(text) {
   }
 }
 
+// --------------------------------------------------------------- the grouping
+
+/** Section order on the page, and the order `agents` is sorted in. */
+const STATUS_RANK = { working: 0, done: 1, idle: 2, finished: 3 };
+
+/** The basename of a cwd, for a row that has one line of room. */
+export function cwdBase(cwd) {
+  if (typeof cwd !== 'string' || cwd === '') return null;
+  if (cwd === '/' || cwd === '\\') return cwd;
+  const base = basename(cwd.replace(/[\\/]+$/, ''));
+  return base === '' ? null : base;
+}
+
+/** When did this terminal last change? `hc` reports whichever ms field it has. */
+function activityOf(t) {
+  for (const key of ['recent_status_ms', 'program_started_ms', 'started_ms', 'created_ms', 'updated_ms']) {
+    if (Number.isFinite(t[key])) return t[key];
+  }
+  return 0;
+}
+
+/** `where` is "space / tab"; used when herdr-app ls is missing. */
+function fromWhere(t) {
+  const [space, tab] = String(t.where ?? '').split(' / ');
+  return { space: (space || '').trim() || null, tab: (tab || '').trim() || null, label: null };
+}
+
+function agentRow(t, status, names) {
+  const where = names.get(t.address) ?? fromWhere(t);
+  return {
+    space: where.space ?? null,
+    tab: where.tab ?? null,
+    address: t.address,
+    agent: t.agent ?? null,
+    label: where.label ?? null,
+    status,
+    turn: Number.isFinite(t.turn) ? t.turn : null,
+    cwdBase: cwdBase(t.cwd),
+  };
+}
+
+function statusOf(t) {
+  if (t.status === 'working') return 'working';
+  if (t.status === 'done') return 'done';
+  return 'idle';
+}
+
+/** Newest activity first inside one status group; address keeps it stable. */
+function compareAgents(a, b, liveByAddress) {
+  const rank = STATUS_RANK[a.status] - STATUS_RANK[b.status];
+  if (rank !== 0) return rank;
+  const at = activityOf(liveByAddress.get(a.address) ?? {});
+  const bt = activityOf(liveByAddress.get(b.address) ?? {});
+  if (at !== bt) return bt - at;
+  const turn = (b.turn ?? -1) - (a.turn ?? -1);
+  if (turn !== 0) return turn;
+  return a.address < b.address ? -1 : a.address > b.address ? 1 : 0;
+}
+
+/**
+ * Turn the terminal lists into what the page draws: one flat `agents` array
+ * (working first, then done, then idle, newest activity first inside a group)
+ * plus the counts for the chips and the section headers.
+ */
+export function groupAgents(live, finished, names = new Map()) {
+  const liveByAddress = new Map(live.map((t) => [t.address, t]));
+  const groups = { working: 0, done: 0, idle: 0, finished: 0 };
+  const agents = [];
+  for (const t of live) {
+    const status = statusOf(t);
+    groups[status] += 1;
+    agents.push(agentRow(t, status, names));
+  }
+  const gone = [];
+  for (const t of finished) {
+    if (liveByAddress.has(t.address)) continue; // --all repeats the live ones
+    gone.push(agentRow(t, 'finished', names));
+  }
+  groups.finished = gone.length;
+  agents.sort((a, b) => compareAgents(a, b, liveByAddress));
+  gone.sort((a, b) => compareAgents(a, b, liveByAddress));
+  return { groups, agents, finished: gone };
+}
+
 /**
  * Merge `herdr-app ls` (spaces, tabs, terminal ids) with `hc ls` (live state)
  * into one list shaped for the page. If herdr-app is unreachable, rebuild the
  * space/tab tree from hc's `where` field ("space / tab") so the page still works.
  */
-export async function readTabs(exec) {
+export async function readTabs(exec, opts = {}) {
   const problems = [];
-  const [appRes, hcRes] = await Promise.all([
+  const [appRes, hcRes, allRes] = await Promise.all([
     exec('herdr-app', ['ls'], { timeout: 5000 }).catch((err) => ({ code: -1, stderr: String(err) })),
     exec('hc', ['ls'], { timeout: 5000 }).catch((err) => ({ code: -1, stderr: String(err) })),
+    exec('hc', ['ls', '--all'], { timeout: 8000 }).catch((err) => ({ code: -1, stderr: String(err) })),
   ]);
 
   const hcJson = hcRes.code === 0 ? parseJson(hcRes.stdout) : null;
@@ -239,7 +324,37 @@ export async function readTabs(exec) {
     }
   }
 
-  return { ok: true, at: new Date().toISOString(), problems, live: live.size, spaces };
+  // Finished terminals live only in `hc ls --all`; when that call fails, fall
+  // back to the count hc keeps in its own summary.
+  const allJson = allRes.code === 0 ? parseJson(allRes.stdout) : null;
+  const finished = [];
+  for (const t of allJson?.terminals ?? []) {
+    if (t && TERMINAL_RE.test(String(t.address))) finished.push(t);
+  }
+  if (!allJson) finished.length = 0;
+
+  const names = new Map();
+  for (const space of spaces) {
+    for (const tab of space.tabs) {
+      for (const term of tab.terminals) {
+        names.set(term.address, { space: space.name, tab: tab.name, label: term.label ?? null });
+      }
+    }
+  }
+
+  const liveList = [...live.values()].filter((t) => TERMINAL_RE.test(String(t.address)));
+  const { groups, agents, finished: goneRows } = groupAgents(liveList, finished, names);
+  if (!allJson) groups.finished = Math.max(0, Number(hcJson?.hidden_finished) || 0);
+
+  return {
+    ok: true,
+    at: new Date().toISOString(),
+    problems,
+    live: live.size,
+    spaces,
+    groups,
+    agents: opts.all ? agents.concat(goneRows) : agents,
+  };
 }
 
 // --------------------------------------------------------------------- the app
@@ -406,7 +521,9 @@ export function createApp(opts = {}) {
     }
 
     if (path === '/api/tabs' && method === 'GET') {
-      const tabs = await readTabs(exec);
+      // ?all=1 is the only way finished terminals reach `agents`.
+      const all = url.searchParams.get('all') === '1';
+      const tabs = await readTabs(exec, { all });
       send(res, 200, tabs);
       return 200;
     }
@@ -637,40 +754,99 @@ export const PAGE = String.raw`<!doctype html>
   button[disabled] { opacity: .45; }
   nav {
     flex: 0 1 auto;
-    max-height: 32dvh;
+    max-height: 40dvh;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
     border-bottom: 1px solid var(--line);
+    overscroll-behavior: contain;
   }
-  .space { border-bottom: 1px solid var(--line); }
-  .space > h2 {
+  .chips {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 6px;
+    padding: 6px 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip {
+    flex: 0 0 auto;
+    min-height: 34px;
+    min-width: 44px;
+    padding: 0 12px;
+    font-size: 13px;
+    white-space: nowrap;
+    border-radius: 999px;
+    color: var(--dim);
+  }
+  .chip .n { font-variant-numeric: tabular-nums; opacity: .8; margin-left: 4px; }
+  .chip[aria-pressed="true"] { background: #2b3340; color: var(--fg); border-color: #3a4553; }
+  .group > h2 {
+    position: sticky;
+    top: 0;
+    z-index: 2;
     margin: 0;
-    padding: 8px 12px 4px;
+    padding: 6px 12px;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: .08em;
     color: var(--dim);
     font-weight: 600;
+    background: var(--panel);
+    border-top: 1px solid var(--line);
   }
-  .space.active > h2 { color: var(--live); }
-  .tab {
+  .group:first-child > h2 { border-top: 0; }
+  .group > h2 .count { color: var(--fg); margin-left: 2px; }
+  .group[data-status="working"] > h2 { color: var(--live); }
+  .agent {
     display: flex;
     align-items: center;
     gap: 10px;
     width: 100%;
     min-height: 44px;
-    padding: 6px 12px;
+    padding: 4px 8px 4px 12px;
     background: transparent;
     border: 0;
     border-top: 1px solid #191e24;
     border-radius: 0;
     text-align: left;
+    color: var(--fg);
+    touch-action: manipulation;
   }
-  .tab[aria-current="true"] { background: #1d2630; }
-  .tab .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
-  .tab .meta { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .agent[aria-current="true"] { background: #1d2630; }
+  .agent .who { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .agent .name { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agent .meta {
+    font-size: 11px;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .agent .read { flex: 0 0 auto; min-height: 34px; min-width: 56px; font-size: 12px; padding: 0 10px; }
+  .finished {
+    display: block;
+    width: 100%;
+    min-height: 44px;
+    padding: 0 12px;
+    text-align: left;
+    font-size: 13px;
+    color: var(--dim);
+    background: transparent;
+    border: 0;
+    border-top: 1px solid var(--line);
+    border-radius: 0;
+  }
+  .empty { padding: 12px; color: var(--dim); font-size: 13px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--idle); flex: 0 0 auto; }
   .dot.working { background: var(--live); animation: pulse 1.6s ease-in-out infinite; }
+  .dot.done { background: #2f9e63; }
+  .dot.finished { background: #3a424c; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
   main {
     flex: 1 1 auto;
@@ -771,8 +947,15 @@ export const PAGE = String.raw`<!doctype html>
   <button id="refresh" aria-label="Refresh sessions">&#8635;</button>
 </header>
 
-<nav id="list" aria-label="Spaces and tabs">
-  <div style="padding:12px;color:#8b98a6;font-size:13px">Loading sessions&hellip;</div>
+<div class="chips" id="chips" role="group" aria-label="Filter agents">
+  <button class="chip" data-filter="all" aria-pressed="true">All<span class="n">0</span></button>
+  <button class="chip" data-filter="working" aria-pressed="false">Working<span class="n">0</span></button>
+  <button class="chip" data-filter="done" aria-pressed="false">Done<span class="n">0</span></button>
+  <button class="chip" data-filter="idle" aria-pressed="false">Idle<span class="n">0</span></button>
+</div>
+
+<nav id="list" aria-label="Agents by status">
+  <div class="empty">Loading agents&hellip;</div>
 </nav>
 
 <main>
@@ -815,9 +998,14 @@ export const PAGE = String.raw`<!doctype html>
 <script>
 (function () {
   'use strict';
-  var state = { terminal: null, spaces: [], timer: null, poll: null, armed: null, armTimer: null, busy: false };
+  var state = {
+    terminal: null, data: null, groups: { working: 0, done: 0, idle: 0, finished: 0 },
+    filter: 'all', all: false, renderedKey: '',
+    timer: null, poll: null, armed: null, armTimer: null, busy: false
+  };
   var el = {
     list: document.getElementById('list'),
+    chips: document.getElementById('chips'),
     out: document.getElementById('out'),
     addr: document.getElementById('addr'),
     termstate: document.getElementById('termstate'),
@@ -905,15 +1093,18 @@ export const PAGE = String.raw`<!doctype html>
     }).catch(function () { el.loginerr.textContent = 'Network error.'; });
   });
 
-  // --- sessions
+  // --- agents
   function loadTabs() {
-    return api('/api/tabs').then(function (data) {
-      state.spaces = data.spaces || [];
-      renderTabs();
+    // ?all=1 is asked for only after the "N finished" line is tapped.
+    return api('/api/tabs' + (state.all ? '?all=1' : '')).then(function (data) {
+      state.data = Array.isArray(data.agents) ? data.agents : [];
+      state.groups = data.groups || { working: 0, done: 0, idle: 0, finished: 0 };
+      renderAgents();
+      paintChips();
       document.getElementById('clock').textContent = new Date(data.at).toTimeString().slice(0, 5);
     }).catch(function (err) {
-      if (err.message !== 'unauthorized') {
-        el.list.innerHTML = '<div style="padding:12px;color:#ff5d5d;font-size:13px">Tab list failed: ' +
+      if (err.message !== 'unauthorized' && !state.data) {
+        el.list.innerHTML = '<div class="empty" style="color:#ff5d5d">Agent list failed: ' +
           esc(err.message) + '</div>';
       }
     });
@@ -925,38 +1116,124 @@ export const PAGE = String.raw`<!doctype html>
     });
   }
 
-  function renderTabs() {
-    var html = '';
-    if (!state.spaces.length) {
-      html = '<div style="padding:12px;color:#8b98a6;font-size:13px">No spaces reported.</div>';
-    }
-    state.spaces.forEach(function (space) {
-      html += '<section class="space' + (space.active ? ' active' : '') + '">';
-      html += '<h2>' + esc(space.name) + '</h2>';
-      if (!space.tabs.length) html += '<div style="padding:0 12px 10px;color:#8b98a6;font-size:13px">no tabs</div>';
-      space.tabs.forEach(function (tab, i) {
-        var term = tab.terminals && tab.terminals[0];
-        var working = tab.terminals.some(function (t) { return t.working; });
-        var meta = term ? term.address : 'none';
-        if (term && term.turn !== null && term.turn !== undefined) meta += ' \u00b7 turn ' + term.turn;
-        html += '<button class="tab" data-terminal="' + esc(term ? term.address : '') + '"' +
-          (term && term.address === state.terminal ? ' aria-current="true"' : '') +
-          (term ? '' : ' disabled') +
-          ' title="' + esc(space.name + ' / ' + tab.name) + '">' +
-          '<span class="dot' + (working ? ' working' : '') + '"></span>' +
-          '<span class="name">' + esc(tab.name) + '</span>' +
-          '<span class="meta">' + esc(meta) + '</span>' +
-          '</button>';
-      });
-      html += '</section>';
+  var SECTIONS = ['working', 'done', 'idle'];
+  var TITLES = { working: 'Working', done: 'Done', idle: 'Idle', finished: 'Finished' };
+
+  function paintChips() {
+    var g = state.groups;
+    var counts = { all: g.working + g.done + g.idle, working: g.working, done: g.done, idle: g.idle };
+    Array.prototype.forEach.call(el.chips.querySelectorAll('.chip'), function (chip) {
+      var key = chip.getAttribute('data-filter');
+      chip.setAttribute('aria-pressed', key === state.filter ? 'true' : 'false');
+      var n = chip.querySelector('.n');
+      if (n) n.textContent = String(counts[key] || 0);
     });
-    el.list.innerHTML = html;
   }
 
+  function rowHtml(a) {
+    var name = a.label || a.agent || a.tab || a.address;
+    var where = [a.space, a.tab].filter(Boolean).join(' / ');
+    var meta = [];
+    if (a.agent && a.agent !== name) meta.push(a.agent);
+    if (where && where !== name) meta.push(where);
+    if (a.turn !== null && a.turn !== undefined) meta.push('turn ' + a.turn);
+    if (a.cwdBase) meta.push(a.cwdBase);
+    if (!meta.length) meta.push(a.address);
+    return '<div class="agent" role="button" tabindex="0" data-terminal="' + esc(a.address) + '"' +
+      ' data-status="' + esc(a.status) + '"' +
+      (a.address === state.terminal ? ' aria-current="true"' : '') +
+      ' title="' + esc(a.address + ' \u00b7 ' + (where || a.address)) + '">' +
+      '<span class="dot ' + esc(a.status) + '"></span>' +
+      '<span class="who"><span class="name">' + esc(name) + '</span>' +
+      '<span class="meta">' + esc(meta.join(' \u00b7 ')) + '</span></span>' +
+      '<button class="read" data-terminal="' + esc(a.address) + '">Read</button>' +
+      '</div>';
+  }
+
+  /**
+   * Draw the sections. force repaints after a chip tap; otherwise identical
+   * poll data leaves the DOM alone, so nothing moves under the thumb.
+   */
+  function renderAgents(force) {
+    var agents = state.data || [];
+    var key = JSON.stringify([state.filter, state.all, state.groups, agents]);
+    if (!force && key === state.renderedKey) return;
+    state.renderedKey = key;
+
+    var nav = el.list;
+    var top = nav.scrollTop;
+    var html = '';
+    var shown = 0;
+
+    SECTIONS.forEach(function (status) {
+      if (state.filter !== 'all' && state.filter !== status) return;
+      var rows = agents.filter(function (a) { return a.status === status; });
+      if (!rows.length) return;
+      shown += rows.length;
+      html += '<section class="group" data-status="' + status + '">' +
+        '<h2>' + TITLES[status] + ' <span class="count">' + rows.length + '</span></h2>' +
+        rows.map(rowHtml).join('') + '</section>';
+    });
+
+    if (state.all && state.filter === 'all') {
+      var gone = agents.filter(function (a) { return a.status === 'finished'; });
+      if (gone.length) {
+        shown += gone.length;
+        html += '<section class="group" data-status="finished">' +
+          '<h2>' + TITLES.finished + ' <span class="count">' + gone.length + '</span></h2>' +
+          gone.map(rowHtml).join('') + '</section>';
+      }
+    }
+
+    if (!state.all) {
+      var n = state.groups.finished || 0;
+      html += '<button class="finished" id="finished" data-expand="1"' + (n ? '' : ' disabled') + '>' +
+        n + ' finished' + (n ? ' \u00b7 tap to show' : '') + '</button>';
+    }
+
+    if (!shown && !state.all && !(state.groups.finished > 0)) {
+      html = '<div class="empty">No agents reported.</div>';
+    } else if (!shown && !state.all) {
+      html += '<div class="empty">Nothing ' + esc(state.filter) + ' right now.</div>';
+    }
+
+    nav.innerHTML = html;
+    nav.scrollTop = top;
+  }
+
+  function setFilter(filter) {
+    if (state.filter === filter) return;
+    state.filter = filter;
+    paintChips();
+    renderAgents(true);
+  }
+
+  el.chips.addEventListener('click', function (ev) {
+    var chip = ev.target.closest('.chip');
+    if (!chip) return;
+    setFilter(chip.getAttribute('data-filter'));
+  });
+
   el.list.addEventListener('click', function (ev) {
-    var btn = ev.target.closest('.tab');
-    if (!btn || btn.disabled) return;
-    var terminal = btn.getAttribute('data-terminal');
+    var expand = ev.target.closest('[data-expand]');
+    if (expand) {
+      if (expand.disabled) return;
+      state.all = true;
+      loadTabs();
+      return;
+    }
+    var row = ev.target.closest('.agent');
+    if (!row) return;
+    var terminal = row.getAttribute('data-terminal');
+    if (terminal) select(terminal);
+  });
+
+  el.list.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    var row = ev.target.closest && ev.target.closest('.agent');
+    if (!row) return;
+    ev.preventDefault();
+    var terminal = row.getAttribute('data-terminal');
     if (terminal) select(terminal);
   });
 
@@ -965,16 +1242,11 @@ export const PAGE = String.raw`<!doctype html>
     el.addr.textContent = terminal;
     el.out.classList.remove('empty');
     el.out.textContent = '';
-    Array.prototype.forEach.call(el.list.querySelectorAll('.tab'), function (btn) {
-      var current = btn.getAttribute('data-terminal') === terminal;
-      btn.setAttribute('aria-current', current ? 'true' : 'false');
-      if (current && btn.scrollIntoView) {
-        try { btn.scrollIntoView({ block: 'nearest' }); } catch (e) { btn.scrollIntoView(false); }
-      }
+    Array.prototype.forEach.call(el.list.querySelectorAll('.agent'), function (row) {
+      row.setAttribute('aria-current', row.getAttribute('data-terminal') === terminal ? 'true' : 'false');
     });
     clearTimeout(state.poll);
     pollScreen(true);
-    scheduleTabs();
   }
 
   function pollScreen(now) {

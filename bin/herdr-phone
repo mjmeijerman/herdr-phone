@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# herdr-phone launcher — run, install as a user unit, or bring up Tailscale
+# without root. Everything happens as the current user: no sudo, no apt, no npm.
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
+SERVER="$ROOT/server.mjs"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_DIR="$CONFIG_HOME/herdr-phone"
+TOKEN_FILE="$CONFIG_DIR/token"
+UNIT_DIR="$CONFIG_HOME/systemd/user"
+UNIT="$UNIT_DIR/herdr-phone.service"
+UNIT_NAME="herdr-phone.service"
+
+BIN_DIR="$HOME/.local/bin"
+TS_BIN="$BIN_DIR/tailscale"
+TSD_BIN="$BIN_DIR/tailscaled"
+TS_RUN="$HOME/.local/share/tailscale"
+TS_STATE="$HOME/.local/share/tailscaled"
+TS_SOCK="$TS_RUN/tailscaled.sock"
+TS_SOCKS="localhost:1055"
+TS_LOG="$TS_RUN/tailscaled.log"
+TS_UP_LOG="$TS_RUN/up.log"
+
+PORT="${PORT:-7455}"
+
+say() { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+
+usage() {
+  cat <<'EOF'
+herdr-phone — watch and type into the Herdr sessions from a phone
+
+usage: herdr-phone <command> [options]
+
+commands
+  run [--port N]     run the server in the foreground (default 127.0.0.1:7455)
+  install            install + enable the herdr-phone systemd user unit, then start it
+  uninstall          stop + disable the unit and remove it
+  token              print where the token lives (never the token itself)
+  url                print the local URL and whether the port answers
+  tailscale          userspace tailscaled + tailscale up + tailscale serve --bg 7455
+  help               this text
+
+environment
+  PORT                 port for run/install (default 7455)
+  HERDR_PHONE_NODE     node binary to use (default: newest fnm/nvm install, else PATH)
+  TAILSCALE_VERSION    pin the tailscale release, e.g. 1.80.2 (default: latest stable)
+EOF
+}
+
+# ---------------------------------------------------------------- node picking
+
+major_of() {
+  "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0
+}
+
+pick_node() {
+  if [ -n "${HERDR_PHONE_NODE:-}" ]; then
+    printf '%s\n' "$HERDR_PHONE_NODE"
+    return 0
+  fi
+  # Highest major wins, whichever package manager installed it. fnm and nvm both
+  # keep their versions in their own directories, so ask each binary.
+  local best="" best_major=-1 cand major
+  for cand in \
+    "$HOME"/.local/share/fnm/node-versions/*/installation/bin/node \
+    "$HOME"/.nvm/versions/node/*/bin/node \
+    "$(command -v node 2>/dev/null || true)"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    major=$(major_of "$cand")
+    if [ "${major:-0}" -gt "$best_major" ]; then
+      best="$cand"
+      best_major="${major:-0}"
+    fi
+  done
+  if [ -z "$best" ]; then
+    warn "no node found: install Node 22+ or set HERDR_PHONE_NODE"
+    return 1
+  fi
+  printf '%s\n' "$best"
+}
+
+require_node() {
+  local node major
+  node=$(pick_node) || exit 1
+  major=$(major_of "$node")
+  if [ "${major:-0}" -lt 22 ]; then
+    warn "herdr-phone needs Node 22 or newer (tested on 26); $node is $(major_of "$node" || echo '?')"
+    exit 1
+  fi
+  printf '%s\n' "$node"
+}
+
+# --------------------------------------------------------------------- commands
+
+cmd_run() {
+  local node
+  node=$(require_node)
+  exec "$node" "$SERVER" "$@"
+}
+
+cmd_install() {
+  local node
+  node=$(require_node)
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=herdr-phone — mobile web UI for Herdr sessions
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$ROOT
+ExecStart=$node $SERVER --port $PORT
+Environment=NODE_ENV=production
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    warn "systemctl --user is not available in this session (no user bus)."
+    warn "the unit is written to $UNIT; run 'systemctl --user enable --now $UNIT_NAME' from a login shell."
+    return 0
+  fi
+  systemctl --user daemon-reload
+  systemctl --user enable "$UNIT_NAME"
+  # restart, not just start: a reinstall must pick up a changed unit file
+  systemctl --user restart "$UNIT_NAME"
+  say "installed and started $UNIT_NAME"
+  say "local:  http://127.0.0.1:$PORT/  (loopback only)"
+  say "token:  $TOKEN_FILE  (created on first request, mode 600)"
+  if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo no)" != "yes" ]; then
+    say "note:   the unit stops when you log out; 'loginctl enable-linger $USER' keeps it up (no root)"
+  fi
+}
+
+cmd_uninstall() {
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
+  fi
+  if [ -f "$UNIT" ]; then
+    rm -f "$UNIT"
+    say "removed $UNIT"
+  else
+    say "no unit at $UNIT"
+  fi
+  systemctl --user daemon-reload 2>/dev/null || true
+  say "the token file stays at $TOKEN_FILE unless you delete it"
+}
+
+cmd_token() {
+  if [ -f "$TOKEN_FILE" ]; then
+    say "$TOKEN_FILE"
+    say "mode: $(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || echo '?')"
+  else
+    say "no token yet: it is created on the first run, at $TOKEN_FILE"
+  fi
+}
+
+cmd_url() {
+  local code
+  say "local: http://127.0.0.1:$PORT/"
+  code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || true)
+  if [ -z "$code" ] || [ "$code" = "000" ]; then
+    say "the port does not answer (server not running)"
+  else
+    say "the port answers with HTTP $code"
+  fi
+}
+
+# -------------------------------------------------------------------- tailscale
+
+ts_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64) printf 'amd64\n' ;;
+    aarch64 | arm64) printf 'arm64\n' ;;
+    armv7l) printf 'arm\n' ;;
+    *) warn "unsupported architecture $(uname -m)"; exit 1 ;;
+  esac
+}
+
+ts_version() {
+  if [ -n "${TAILSCALE_VERSION:-}" ]; then
+    printf '%s\n' "$TAILSCALE_VERSION"
+    return 0
+  fi
+  local arch json version
+  arch=$(ts_arch)
+  # pkgs.tailscale.com answers ?mode=json with a Tarballs map per architecture.
+  json=$(curl -fsSL -m 20 'https://pkgs.tailscale.com/stable/?mode=json' 2>/dev/null | tr -d '\n\t ' || true)
+  version=$(printf '%s' "$json" | sed -n "s/.*\"${arch}\":\"tailscale_\([0-9][0-9.]*\)_[a-z0-9]*\.tgz\".*/\1/p" | head -1)
+  if [ -z "$version" ]; then
+    version=$(printf '%s' "$json" | sed -n 's/.*"Version":"\([0-9][0-9.]*\)".*/\1/p' | head -1)
+  fi
+  if [ -z "$version" ]; then
+    version=$(curl -fsSL -m 20 'https://pkgs.tailscale.com/stable/' 2>/dev/null \
+      | sed -n "s/.*tailscale_\([0-9][0-9.]*\)_${arch}\.tgz.*/\1/p" | sort -V | tail -1 || true)
+  fi
+  if [ -z "$version" ]; then
+    warn "could not resolve the latest tailscale version; set TAILSCALE_VERSION, e.g. TAILSCALE_VERSION=1.104.7"
+    exit 1
+  fi
+  printf '%s\n' "$version"
+}
+
+ts_download() {
+  local arch version tmp tarball
+  arch=$(ts_arch)
+  version=$(ts_version)
+  mkdir -p "$BIN_DIR" "$TS_RUN"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-phone-ts.XXXXXX")
+  tarball="$tmp/tailscale.tgz"
+  say "downloading tailscale $version ($arch) into $BIN_DIR"
+  curl -fsSL -m 180 -o "$tarball" \
+    "https://pkgs.tailscale.com/stable/tailscale_${version}_${arch}.tgz"
+  tar -xzf "$tarball" -C "$tmp"
+  if [ -f "$tmp/tailscale_${version}_${arch}/tailscale" ]; then
+    install -m 0755 "$tmp/tailscale_${version}_${arch}/tailscale" "$TS_BIN"
+    install -m 0755 "$tmp/tailscale_${version}_${arch}/tailscaled" "$TSD_BIN"
+  else
+    warn "unexpected tarball layout in $tarball"
+    rm -rf "$tmp"
+    exit 1
+  fi
+  rm -rf "$tmp"
+  say "installed $TS_BIN and $TSD_BIN"
+}
+
+ts_socket_up() { [ -S "$TS_SOCK" ]; }
+
+ts_start_daemon() {
+  if ts_socket_up; then
+    say "tailscaled already running ($TS_SOCK)"
+    return 0
+  fi
+  if ! [ -x "$TSD_BIN" ]; then
+    warn "tailscaled is not installed; run 'herdr-phone tailscale' again"
+    exit 1
+  fi
+  mkdir -p "$TS_STATE" "$TS_RUN"
+  # userspace networking: no /dev/net/tun, no root, outbound only via SOCKS5
+  nohup "$TSD_BIN" \
+    --tun=userspace-networking \
+    --statedir="$TS_STATE" \
+    --socket="$TS_SOCK" \
+    --socks5-server="$TS_SOCKS" \
+    >>"$TS_LOG" 2>&1 &
+  local waited=0
+  while [ "$waited" -lt 60 ]; do
+    ts_socket_up && break
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+  if ts_socket_up; then
+    say "tailscaled started ($TS_SOCK, SOCKS5 on $TS_SOCKS)"
+  else
+    warn "tailscaled did not open $TS_SOCK; see $TS_LOG"
+    exit 1
+  fi
+}
+
+ts_status() {
+  "$TS_BIN" --socket="$TS_SOCK" status 2>/dev/null || true
+}
+
+ts_serve() {
+  if ! "$TS_BIN" --socket="$TS_SOCK" status >/dev/null 2>&1; then
+    warn "tailscale is not logged in yet; run 'herdr-phone tailscale' again after approving the login"
+    return 0
+  fi
+  if "$TS_BIN" --socket="$TS_SOCK" serve --bg "$PORT" >/dev/null 2>&1; then
+    local dns
+    dns=$("$TS_BIN" --socket="$TS_SOCK" status --json 2>/dev/null \
+      | sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    if [ -n "$dns" ]; then
+      say "serving: https://${dns%/}/  ->  127.0.0.1:$PORT"
+    else
+      say "tailscale serve is up for port $PORT (see 'tailscale serve status')"
+    fi
+    say "the token is still required: serving faces your tailnet, the token faces everyone"
+  else
+    warn "tailscale serve --bg $PORT failed; run: tailscale serve --bg $PORT"
+  fi
+}
+
+cmd_tailscale() {
+  if ! [ -x "$TS_BIN" ] || ! [ -x "$TSD_BIN" ]; then
+    ts_download
+  else
+    say "tailscale already at $TS_BIN"
+  fi
+  ts_start_daemon
+
+  if ts_status | grep -qi 'logged out'; then
+    say "starting tailscale up (a login URL follows; this never blocks)"
+    : >"$TS_UP_LOG"
+    nohup "$TS_BIN" --socket="$TS_SOCK" up >>"$TS_UP_LOG" 2>&1 &
+    local url="" waited=0
+    while [ "$waited" -lt 60 ]; do
+      url=$(sed -n 's#.*\(https://login\.tailscale\.com/[A-Za-z0-9/._?=&-]*\).*#\1#p' "$TS_UP_LOG" | head -1)
+      [ -n "$url" ] && break
+      ts_status | grep -qi 'logged out' || break
+      sleep 0.25
+      waited=$((waited + 1))
+    done
+    if [ -n "$url" ]; then
+      say ""
+      say "Open this on any device and log in:"
+      say "  $url"
+      say ""
+      say "then run 'herdr-phone tailscale' again to finish (serve --bg $PORT)"
+      exit 0
+    fi
+    say "no login URL appeared yet; check $TS_UP_LOG, then re-run 'herdr-phone tailscale'"
+    exit 0
+  fi
+
+  ts_serve
+}
+
+# ------------------------------------------------------------------------ main
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+  run) cmd_run "$@" ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  token) cmd_token ;;
+  url) cmd_url ;;
+  tailscale) cmd_tailscale ;;
+  help | -h | --help) usage ;;
+  *)
+    warn "unknown command: $cmd"
+    usage >&2
+    exit 2
+    ;;
+esac
